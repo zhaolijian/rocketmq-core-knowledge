@@ -1,0 +1,48 @@
+1.部署架构
+
+RocketMQ架构上主要分为四部分，如上图所示:
+* Producer：消息发布的角色，支持分布式集群方式部署。Producer通过MQ的负载均衡模块选择相应的Broker集群队列进行消息投递，投递的过程支持快速失败并且低延迟。
+* Consumer：消息消费的角色，支持分布式集群方式部署。支持以push推，pull拉两种模式对消息进行消费。同时也支持集群方式和广播方式的消费，它提供实时消息订阅机制，可以满足大多数用户的需求。
+* NameServer：NameServer是一个非常简单的路由注册中心，其角色类似Dubbo中的zookeeper，支持Broker的动态注册与发现。主要包括两个功能：
+1. Broker管理，NameServer接受Broker集群的注册信息并且保存下来作为路由信息的基本数据。然后提供心跳检测机制，检查Broker是否还存活；
+2. 路由信息管理，每个NameServer将保存关于Broker集群的整个路由信息和用于客户端查询的队列信息。然后Producer和Conumser通过NameServer就可以知道整个Broker集群的路由信息，从而进行消息的投递和消费。NameServer通常也是集群的方式部署，各实例间相互不进行信息通讯。Broker是向每一台NameServer注册自己的路由信息，所以每一个NameServer实例上面都保存一份完整的路由信息。当某个NameServer因某种原因下线了，Broker仍然可以向其它NameServer同步其路由信息，Producer,Consumer仍然可以动态感知Broker的路由的信息。
+* BrokerServer：Broker主要负责消息的存储、投递和查询以及服务高可用保证，为了实现这些功能，Broker包含了以下几个重要子模块。
+1. Remoting Module：整个Broker的实体，负责处理来自clients端的请求。
+2. Client Manager：负责管理客户端(Producer/Consumer)和维护Consumer的Topic订阅信息
+3. Store Service：提供方便简单的API接口处理消息存储到物理硬盘和查询功能。
+4. HA Service：高可用服务，提供Master Broker 和 Slave Broker之间的数据同步功能。
+5. Index Service：根据特定的Message key对投递到Broker的消息进行索引服务，以提供消息的快速查询。
+
+
+Rocketmq集群工作流程：
+* 启动NameServer，NameServer起来后监听端口，等待Broker、Producer、Consumer连上来，相当于一个路由控制中心。
+* Broker启动，跟所有的NameServer保持长连接，定时发送心跳包。心跳包中包含当前Broker信息(IP+端口等)以及存储所有Topic信息。注册成功后，NameServer集群中就有Topic跟Broker的映射关系。
+* 收发消息前，先创建Topic，创建Topic时需要指定该Topic要存储在哪些Broker上，也可以在发送消息时自动创建Topic。
+* Producer发送消息，启动时先跟NameServer集群中的其中一台建立长连接，并从NameServer中获取当前发送的Topic存在哪些Broker上，轮询从队列列表中选择一个队列，然后与队列所在的Broker建立长连接从而向Broker发消息。
+* Consumer跟Producer类似，跟其中一台NameServer建立长连接，获取当前订阅Topic存在哪些Broker上，然后直接跟Broker建立连接通道，开始消费消息。
+
+2.如何根据messageId查消息？
+RocketMQ中的MessageId的长度总共有16字节，其中包含了消息存储主机地址（IP地址和端口），消息Commit Log offset。“按照MessageId查询消息”在RocketMQ中具体做法是：Client端从MessageId中解析出Broker的地址（IP地址和端口）和Commit Log的偏移地址后封装成一个RPC请求后通过Remoting通信层发送（业务请求码：VIEW_MESSAGE_BY_ID）。Broker端走的是QueryMessageProcessor，读取消息的过程用其中的 commitLog offset 和 size 去 commitLog 中找到真正的记录并解析成一个完整的消息返回。
+
+3.消息重试相关策略
+* retryTimesWhenSendFailed:同步发送失败重投次数，默认为2，因此生产者会最多尝试发送retryTimesWhenSendFailed + 1次。不会选择上次失败的broker，尝试向其他broker发送，最大程度保证消息不丢。超过重投次数，抛出异常，由客户端保证消息不丢。当出现RemotingException、MQClientException和部分MQBrokerException时会重投。
+* retryTimesWhenSendAsyncFailed:异步发送失败重试次数，默认为2，异步重试不会选择其他broker，仅在同一个broker上做重试，不保证消息不丢。
+* retryAnotherBrokerWhenNotStoreOK:消息刷盘（主或备）超时或slave不可用（返回状态非SEND_OK），是否尝试发送到其他broker，默认false。十分重要消息可以开启。
+
+4.流量控制
+生产者流控，因为broker处理能力达到瓶颈；消费者流控，因为消费能力达到瓶颈。
+4.1生产者流控
+* commitLog文件被锁时间超过osPageCacheBusyTimeOutMills时，参数默认为1000ms，返回流控。
+* 如果开启transientStorePoolEnable == true，且broker为异步刷盘的主机，且transientStorePool中资源不足，拒绝当前send请求，返回流控。
+* broker每隔10ms检查send请求队列头部请求的等待时间，如果超过waitTimeMillsInSendQueue，默认200ms，拒绝当前send请求，返回流控。
+* broker通过拒绝send 请求方式实现流量控制。
+注意，生产者流控，不会尝试消息重投。
+
+4.2消费者流控
+* 消费者本地缓存消息数超过pullThresholdForQueue时，默认1000。
+* 消费者本地缓存消息大小超过pullThresholdSizeForQueue时，默认100MB。
+* 消费者本地缓存消息跨度超过consumeConcurrentlyMaxSpan时，默认2000。
+消费者流控的结果是降低拉取频率。
+
+参考博客：https://www.itmuch.com/books/rocketmq/
+Rocketmq源码解析：https://github.com/HScarb/knowledge/blob/master/rocketmq/ 
